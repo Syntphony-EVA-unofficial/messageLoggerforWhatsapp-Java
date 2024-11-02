@@ -1,0 +1,14 @@
+{
+   "data":{
+      "messaging_product":"whatsapp",
+      "recipient_type":"individual",
+      "to":"819046050746",
+      "type":"text",
+      "text":{
+         "preview_url":true,
+         "body":"echo: E"
+      }
+   },
+   "sender":"Syntphony",
+   "phoneId":"401319809740632"
+}
