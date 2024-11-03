@@ -3,10 +3,12 @@ import os
 import concurrent
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS, cross_origin
+from flask_socketio import SocketIO, emit
 from pymongo import MongoClient
 import logging
 import pytz
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
 
 
 # Load environment variables from .env file
@@ -21,10 +23,114 @@ db = client['SyntphonyWhatsappLogs']  # Asegúrate de que este nombre coincide c
 
 app = Flask(__name__)
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+
 app.config['CORS_HEADERS'] = 'Content-Type'
 
 logging.basicConfig(level=logging.INFO, handlers=[logging.StreamHandler()])
 logger = logging.getLogger(__name__)
+
+
+
+@app.route('/messageLogger', methods=['POST'])
+def messageLogger():
+    data = request.get_json()
+    logger.info(f"Received a POST request to /messageLogger {data}")
+    
+    if not isinstance(data, dict) or "messages" not in data or not isinstance(data["messages"], list):
+        return jsonify({"error": "Invalid data format, expected a dictionary with a 'messages' array"}), 400
+
+    messages = data["messages"]
+    metadata_batch = [get_metadata(message) for message in messages]
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        executor.submit(store_data_in_db, metadata_batch)
+
+    return jsonify({"message": "Data logged successfully"}), 200
+
+
+
+if __name__ == "__main__":
+    port = int(os.getenv('PORT', 8080))
+    logger.info(f"Starting Flask-SocketIO app on port {port}")
+    socketio.run(app, host='0.0.0.0', port=port)
+
+def store_data_in_db(metadata_batch):
+    if not metadata_batch:
+        logger.info("No metadata to process.")
+        return
+
+    metadata_batch = [metadata for metadata in metadata_batch if metadata['record']]
+    if not metadata_batch:
+        logger.info("No valid metadata to process after filtering.")
+        return
+
+    first_metadata = metadata_batch[0]
+    phone_id = first_metadata.get('companyphone')
+    client_phone = first_metadata.get('clientphone')
+    current_time = datetime.now(timezone.utc).isoformat()
+
+    if phone_id and client_phone:
+        collection = db[phone_id]
+        existing_doc = collection.find_one({"client_phone": client_phone})
+
+        bulk_messages = [
+            {
+                "sender": metadata["data"]["sender"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "payload": metadata["data"]["data"]
+            }
+            for metadata in metadata_batch
+        ]
+
+        if existing_doc:
+            last_interaction_time = datetime.fromisoformat(existing_doc["end_time"])
+            if datetime.now(timezone.utc) - last_interaction_time < timedelta(hours=24):
+                new_end_time = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+                collection.update_one(
+                    {"_id": existing_doc["_id"]},
+                    {
+                        "$set": {"end_time": new_end_time, "last_updated": current_time},
+                        "$push": {"messages": {"$each": bulk_messages}}
+                    }
+                )
+                logger.info(f"Updated existing document for client {client_phone} with new bulk messages")
+                
+                # Emit update to clients via SocketIO
+                socketio.emit('update', {'phone_id': phone_id, 'client_phone': client_phone, 'update_type': 'update'}, broadcast=True)
+            else:
+                new_doc = {
+                    "client_phone": client_phone,
+                    "phoneid": phone_id,
+                    "start_time": current_time,
+                    "end_time": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+                    "created_at": current_time,
+                    "last_updated": current_time,
+                    "messages": bulk_messages
+                }
+                collection.insert_one(new_doc)
+                logger.info(f"Created new document for client {client_phone} with bulk messages (new session)")
+                
+                # Emit new session to clients via SocketIO
+                socketio.emit('update', {'phone_id': phone_id, 'client_phone': client_phone, 'update_type': 'new'}, broadcast=True)
+        else:
+            new_doc = {
+                "client_phone": client_phone,
+                "phoneid": phone_id,
+                "start_time": current_time,
+                "end_time": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+                "created_at": current_time,
+                "last_updated": current_time,
+                "messages": bulk_messages
+            }
+            collection.insert_one(new_doc)
+            logger.info(f"Created new document for client {client_phone} with bulk messages")
+            
+            # Emit new session to clients via SocketIO
+            socketio.emit('update', {'phone_id': phone_id, 'client_phone': client_phone, 'update_type': 'new'}, broadcast=True)
+    else:
+        logger.error("phone_id or client_phone not found in data")
 
 def extract_status(data):
     try:
@@ -129,8 +235,6 @@ def get_metadata(data):
     metadata['data'] = data
     return metadata
 
-
-
 def extract_recipient_id(data):
     try:
         for entry in data["data"]["entry"]:
@@ -142,111 +246,3 @@ def extract_recipient_id(data):
     except KeyError:
         logger.error("recipient_id not found in data")
         return None
-
-
-
-@app.route('/messageLogger', methods=['POST'])
-def messageLogger():
-    data = request.get_json()
-
-    logger.info(f"Received a POST request to /messageLogger {data}")
-    
-    # Receive the request payload
-
-    # Check if the data contains the "messages" array
-    if not isinstance(data, dict) or "messages" not in data or not isinstance(data["messages"], list):
-        return jsonify({"error": "Invalid data format, expected a dictionary with a 'messages' array"}), 400
-
-    # Extract the messages array
-    messages = data["messages"]
-
-    # Extract metadata for each message in the array
-    metadata_batch = [get_metadata(message) for message in messages]
-
-    # Process all messages in one operation
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        executor.submit(store_data_in_db, metadata_batch)
-
-    return jsonify({"message": "Data logged successfully"}), 200
-
-from datetime import datetime, timedelta, timezone
-
-def store_data_in_db(metadata_batch):
-    if not metadata_batch:
-        logger.info("No metadata to process.")
-        return
-
-    metadata_batch = [metadata for metadata in metadata_batch if metadata['record']]
-
-    if not metadata_batch:
-        logger.info("No valid metadata to process after filtering.")
-        return
-
-    first_metadata = metadata_batch[0]
-    phone_id = first_metadata.get('companyphone')
-    client_phone = first_metadata.get('clientphone')
-    current_time = datetime.now(timezone.utc).isoformat()
-
-    if phone_id and client_phone:
-        collection = db[phone_id]
-        existing_doc = collection.find_one({"client_phone": client_phone})
-
-        bulk_messages = [
-            {
-                "sender": metadata["data"]["sender"],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "payload": metadata["data"]["data"]
-            }
-            for metadata in metadata_batch
-        ]
-
-        if existing_doc:
-            last_interaction_time = datetime.fromisoformat(existing_doc["end_time"])
-            if datetime.now(timezone.utc) - last_interaction_time < timedelta(hours=24):
-                # Extend the end_time by 24 hours from the current time
-                new_end_time = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-                
-                # Update existing document with new messages and extend the 24-hour window
-                collection.update_one(
-                    {"_id": existing_doc["_id"]},
-                    {
-                        "$set": {"end_time": new_end_time, "last_updated": current_time},
-                        "$push": {"messages": {"$each": bulk_messages}}
-                    }
-                )
-                logger.info(f"Updated existing document for client {client_phone} with new bulk messages")
-            else:
-                # Create a new document if the last interaction is older than 24 hours
-                new_doc = {
-                    "client_phone": client_phone,
-                    "phoneid": phone_id,
-                    "start_time": current_time,
-                    "end_time": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),  # Set a 24-hour window
-                    "created_at": current_time,
-                    "last_updated": current_time,
-                    "messages": bulk_messages
-                }
-                collection.insert_one(new_doc)
-                logger.info(f"Created new document for client {client_phone} with bulk messages (new session)")
-        else:
-            # Create a new document as no existing document is found
-            new_doc = {
-                "client_phone": client_phone,
-                "phoneid": phone_id,
-                "start_time": current_time,
-                "end_time": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),  # Set a 24-hour window
-                "created_at": current_time,
-                "last_updated": current_time,
-                "messages": bulk_messages
-            }
-            collection.insert_one(new_doc)
-            logger.info(f"Created new document for client {client_phone} with bulk messages")
-    else:
-        logger.error("phone_id or client_phone not found in data")
-
-
-
-if __name__ == "__main__":
-    port = int(os.getenv('PORT', 8080))
-    logger.info(f"Starting Flask app on port {port}")
-    app.run(host='0.0.0.0', port=port)
