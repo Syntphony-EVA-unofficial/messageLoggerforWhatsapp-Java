@@ -6,3 +6,4 @@ pytz
 pymongo
 werkzeug
 flask-socketio
+eventlet

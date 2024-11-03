@@ -1,3 +1,8 @@
+
+
+import eventlet
+eventlet.monkey_patch()
+
 from datetime import datetime, timedelta, timezone
 import os
 import concurrent
@@ -52,9 +57,9 @@ def messageLogger():
 
 
 if __name__ == "__main__":
-    port = int(os.getenv('PORT', 8080))
+    port = int(os.getenv('PORT', 5001))
     logger.info(f"Starting Flask-SocketIO app on port {port}")
-    socketio.run(app, host='0.0.0.0', port=port)
+    socketio.run(app, host='0.0.0.0', port=port, debug=True)
 
 def store_data_in_db(metadata_batch):
     if not metadata_batch:
@@ -98,7 +103,8 @@ def store_data_in_db(metadata_batch):
                 logger.info(f"Updated existing document for client {client_phone} with new bulk messages")
                 
                 # Emit update to clients via SocketIO
-                socketio.emit('update', {'phone_id': phone_id, 'client_phone': client_phone, 'update_type': 'update'}, broadcast=True)
+                # Emit update for an existing conversation
+                socketio.emit('conversation_updated', {'phone_id': phone_id, 'client_phone': client_phone, 'messages': bulk_messages}, broadcast=True)
             else:
                 new_doc = {
                     "client_phone": client_phone,
@@ -113,7 +119,8 @@ def store_data_in_db(metadata_batch):
                 logger.info(f"Created new document for client {client_phone} with bulk messages (new session)")
                 
                 # Emit new session to clients via SocketIO
-                socketio.emit('update', {'phone_id': phone_id, 'client_phone': client_phone, 'update_type': 'new'}, broadcast=True)
+                socketio.emit('new_conversation', {'phone_id': phone_id, 'client_phone': client_phone}, broadcast=True)
+
         else:
             new_doc = {
                 "client_phone": client_phone,
@@ -128,7 +135,7 @@ def store_data_in_db(metadata_batch):
             logger.info(f"Created new document for client {client_phone} with bulk messages")
             
             # Emit new session to clients via SocketIO
-            socketio.emit('update', {'phone_id': phone_id, 'client_phone': client_phone, 'update_type': 'new'}, broadcast=True)
+            socketio.emit('new_conversation', {'phone_id': phone_id, 'client_phone': client_phone}, broadcast=True)
     else:
         logger.error("phone_id or client_phone not found in data")
 
